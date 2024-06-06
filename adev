@@ -1,0 +1,136 @@
+#!/bin/bash
+
+USER="axelmanzanilla"
+DATABASES_DIR="/Users/$USER/Downloads"
+ODOO_DIR="/Users/$USER/odoo"
+FILESTORE_DIR="$HOME/Library/Application Support/Odoo/filestore"
+CONFIG_DIR="$ODOO_DIR/conf"
+SOURCE_DIR="$ODOO_DIR/source"
+VENVS_DIR="$ODOO_DIR/venv"
+DEVS_DIR="$ODOO_DIR/dev"
+CUSTOM_DEVS="$DEVS_DIR/personal"
+
+function is_odoo_database(){
+    local dbname="$1"
+    if psql -d "$dbname" -t -c "SELECT to_regclass('ir_module_module');" | grep -q 'ir_module_module'; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function database_exists(){
+    local dbname="$1"
+    if psql -lqt | cut -d \| -f 1 | grep -qw "$dbname"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function get_version(){
+    local dbname="$1"
+    if is_odoo_database "$dbname"; then
+        local version=$(psql -d "$dbname" -t -c "SELECT latest_version FROM ir_module_module WHERE name = 'base'")
+        version=$(echo "$version" | tr -d '[:space:]')
+        version=$(echo "$version" | tr '~' '-')
+        version=$(echo "$version" | rev | cut -c 5- | rev)
+        echo "$version"
+    else
+        echo "None"
+    fi
+}
+
+function get_addons_path(){
+    local dbname="$1"
+    if is_odoo_database "$dbname"; then
+        addons_path=$(cat "$CONFIG_DIR/$dbname.conf" | grep -E '^addons_path' | cut -d'=' -f2 | tr -d '[:space:]' | tr -s ',' ' ')
+        database_path=""
+        for path in $addons_path; do
+            if [[ "$path" == "$DEVS_DIR"* ]] && [[ "$path" != "$CUSTOM_DEVS"* ]]; then
+                path_short="${path/$DEVS_DIR/}"
+                database_path+="$path_short, "
+            fi
+        done
+        database_path=$(echo "$database_path" | rev | cut -c 3- | rev)
+        echo "$database_path"
+    fi
+}
+
+function neutralize() {
+    psql -d "$1" -c "
+        UPDATE ir_cron SET active='f';
+        UPDATE ir_mail_server SET active='f';
+        UPDATE res_users SET login='admin_old' WHERE login='admin';
+        UPDATE res_users SET login='admin2_old' WHERE login='admin2';
+        UPDATE res_users SET login='admin2',password='admin2',totp_secret='' WHERE id=(SELECT id FROM res_users WHERE active='t' AND id!=1 ORDER BY id LIMIT 1);
+        UPDATE res_users SET login='admin',password='admin',active='t',totp_secret='' WHERE id=1;
+        UPDATE ir_config_parameter SET value = '2040-01-01 00:00:00' WHERE key = 'database.expiration_date';
+        UPDATE ir_ui_view SET active = 'f' WHERE id in (SELECT id FROM ir_ui_view WHERE  name like '%saas trial assets%');
+        DELETE FROM ir_attachment WHERE name like '%assets';"
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -v|--version)
+            echo "aDev version 0.0.3";
+            break;
+            ;;
+        create)
+            dbname=$2;
+            dbpath=$(ls -d $DATABASES_DIR/*/ | xargs -n1 basename | grep "$dbname")
+
+            if [ -z "$dbpath" ]; then
+                echo "Database $dbname not found"
+                exit 1
+            elif database_exists "$dbname"; then
+                echo "Database $dbname already exists"
+                exit 1
+            else
+                createdb "$dbname";
+                psql "$dbname" < "$DATABASES_DIR/$dbpath"/dump.sql;
+                mkdir -p "$FILESTORE_DIR/$dbname"
+                if [ -d "$DATABASES_DIR/$dbpath/filestore" ] && [ "$(ls -A $DATABASES_DIR/$dbpath/filestore)" ]; then
+                    cp -r "$DATABASES_DIR/$dbpath/filestore"/* "$FILESTORE_DIR/$dbname"
+                fi
+                neutralize "$dbname";
+                version=$(get_version "$dbname")
+                cp "$ODOO_DIR/conf/$version.conf" "$CONFIG_DIR/$dbname.conf"
+                echo "db_name=$dbname" >> "$CONFIG_DIR/$dbname.conf"
+                "$VENVS_DIR/$version/bin/python" "$SOURCE_DIR/$version/odoo/odoo-bin" --config="$CONFIG_DIR/$dbname.conf" -i odoo_developer_tools --stop-after-init
+                echo "Database $dbname created and neutralized with version $version"
+            fi
+            break;
+            ;;
+        list)
+            databases=$(psql -lqt | cut -d \| -f 1 | grep -v -E 'postgres|template0|template1')
+            databases=" " read -r -a db_array <<< "$databases"
+            string_to_show+="|-------------------|-----------|-------------------------------\n";
+            string_to_show+="|     database      |  version  |          module paths         \n";
+            string_to_show+="|-------------------|-----------|-------------------------------\n";
+            for dbname in $databases; do
+                if is_odoo_database "$dbname"; then
+                    addons_path=$(get_addons_path "$dbname");
+                    dbname_space=" $dbname                 "
+                    dbname_short="${dbname_space:0:19}"
+                    string_to_show+="|$dbname_short| $(get_version "$dbname")\t| $addons_path\n";
+                fi
+            done
+            string_to_show+="|-------------------|-----------|-------------------------------\n";
+            echo -e "$string_to_show";
+            break;
+            ;;
+        run)
+            dbname=$2;
+            version=$(get_version "$dbname");
+            "$VENVS_DIR/$version/bin/python" "$SOURCE_DIR/$version/odoo/odoo-bin" --config="$CONFIG_DIR/$dbname.conf" "${@:3}";
+            break;
+            ;;
+        *)
+            echo "Unknown parameter: $1";
+            exit 1;
+            ;;
+    esac
+done
+
+exit 0
